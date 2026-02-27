@@ -21,6 +21,7 @@ def main():
         )
         for prompt in prompts
     ]
+    # 模型入口
     outputs = llm.generate(prompts, sampling_params)
 
     for prompt, output in zip(prompts, outputs):

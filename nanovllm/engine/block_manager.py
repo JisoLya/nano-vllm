@@ -48,6 +48,11 @@ class BlockManager:
         self.used_block_ids.add(block_id)
         return self.blocks[block_id]
 
+    '''
+    至于这里为什么hash_to_block_id为什么不清空
+    是因为这里的block_manager代表了逻辑层，而实际的物理数据是lazy擦除的，也就是即便此时没有block_ref
+    物理数据也会保留下来，直到新的数据(hash)到来
+    '''
     def _deallocate_block(self, block_id: int) -> Block:
         assert self.blocks[block_id].ref_count == 0
         self.used_block_ids.remove(block_id)
@@ -91,6 +96,8 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
+        # 由于这里的seq是一个一个增长的，所以这里只需要判断恰好多出一个token的情况（如果len(seq) % self.block_size == 2， 证明这个seq
+        # 恰好多出了两个token，这两个token已经在新的一个block中了，此时不需要append操作）
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):

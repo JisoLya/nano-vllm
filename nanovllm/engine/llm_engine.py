@@ -47,7 +47,9 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        # 执行推理
         token_ids = self.model_runner.call("run", seqs, is_prefill)
+        # 后处理
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
@@ -67,9 +69,11 @@ class LLMEngine:
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):
+            # 真正将prompt和sampler传入给大模型
             self.add_request(prompt, sp)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
+        # 统计吞吐量
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()

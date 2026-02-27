@@ -189,6 +189,7 @@ class ModelRunner:
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            # enforce_eager: PyTorch 按照 Python 代码的顺序，逐行将操作发送到 GPU 运行
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
@@ -206,9 +207,13 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        # 区别是prefill阶段还是decode阶段
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        # 设置温度
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        # 输出概率
         logits = self.run_model(input_ids, positions, is_prefill)
+        # 采样
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
