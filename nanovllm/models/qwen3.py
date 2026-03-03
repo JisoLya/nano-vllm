@@ -73,7 +73,14 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # 破案了，之前这里疑惑为什么形状对不上
+        # a和b的形状都是2 * 3
+        # print(torch.nn.functional.linear(a, b))
+        # 这里计算的是a @ b.transpose() 这个函数自带转置
         qkv = self.qkv_proj(hidden_states)
+        # 这里按列切分(便于后续的计算，因为我们要乘以转置x @ W_qkv.transpose, x.shape 一般是(token_nums, hidden_states))那么存储的qkv.shape应该是[hidden_states, q_size + 2 * kv_size]
+        # 值得注意的是：但是这里的hidden_states包括了多个序列的隐藏层，假设现在有两个seq， 长度分别为2, 3，那么这里的hidden_states就是(2 + 3) * model_states
+        # PS：因为做QKV投影的时候不需要知道当前的token属于哪个序列，真正进行拆分被放到了下面 self.attn(q,k,v)中
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
@@ -187,6 +194,7 @@ class Qwen3Model(nn.Module):
 
 
 class Qwen3ForCausalLM(nn.Module):
+    # 在loader.py中被使用，用来加载权重的映射
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),

@@ -30,8 +30,10 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        # 初始化采样器
         self.sampler = Sampler()
         self.warmup_model()
+        # 分配kv cache
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -91,8 +93,12 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+        # max_num_batched_tokens 单次forward中可以支持的最大token数
+        # max_model_len 单个seq支持的最大token长度
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
+        # 满载情况下可以跑的最大序列个数
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
+        # 初始化num_seqs个seq，传入model
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
         self.run(seqs, True)
         torch.cuda.empty_cache()
@@ -100,12 +106,15 @@ class ModelRunner:
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
+        # free 当前gpu可用的显存， total总共可用的显存数
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        # hf_config.num_key_value_heads模型总的kv头数 这里有Tensor Parallel， 所以需要分配到每一块gpu上，num_kv_heads每一块gpu上的kv头数
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        # torch_dtype数据类型，视模型而定
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0

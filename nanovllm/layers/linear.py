@@ -86,8 +86,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
         param_data = param.data
+        # loaded_sharded_id: gate对应为0， up对应为1 （Qwen3ForCasualLm类里边的那个字典映射）
+        # 计算得到的是在当前这个GPU上的偏移量
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
         shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
+        # 将分配的存储空间进行裁剪
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param_data.copy_(loaded_weight)
@@ -106,8 +109,10 @@ class QKVParallelLinear(ColumnParallelLinear):
         tp_size = dist.get_world_size()
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
+        # 使用了TP，当前的GPU只需要计算一下总头数/tp_size的注意力头
         self.num_heads = divide(total_num_heads, tp_size)
         self.num_kv_heads = divide(total_num_kv_heads, tp_size)
+
         output_size = (total_num_heads + 2 * total_num_kv_heads) * self.head_size
         super().__init__(hidden_size, output_size, bias)
 
@@ -115,6 +120,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         param_data = param.data
         assert loaded_shard_id in ["q", "k", "v"]
         if loaded_shard_id == "q":
+            # Qwen采用了GQA，即多个Q共享一个KV，因此这里的q_size和k_size, v_size有一定的从差别，取决于GQA的参数。
+            # 在example里这里GQA是2个Q共享一个KV
             shard_size = self.num_heads * self.head_size
             shard_offset = 0
         elif loaded_shard_id == "k":

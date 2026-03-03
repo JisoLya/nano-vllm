@@ -55,9 +55,15 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     def forward(self, x: torch.Tensor):
         context = get_context()
+        # prefill阶段的优化
+        # 假设此时经过所有的decoder后， 输出两个seq分别为[[1,11,23], [2,3]]
+        # 此时的x的shape[5, hidden_state]
+        # 在prefill阶段只需要最后一个单词的hidden_state因此需要对这个5进行裁切（我们不需要计算seq[0]的第一个token对应下一个token的概率）
         if context.is_prefill:
+            # 获取累计索引 context.cu_seqlens_q 这个返回[0,3,5], 用[1:]进行裁剪得到[3,5]， -1就得到了真实的两个seq最后一个token的idx 为[2,4]
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
+        # 映射为概率
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
