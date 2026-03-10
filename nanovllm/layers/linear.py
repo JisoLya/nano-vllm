@@ -66,6 +66,8 @@ class ColumnParallelLinear(LinearBase):
         param_data = param.data
         shard_size = param_data.size(self.tp_dim)
         start_idx = self.tp_rank * shard_size
+        # 如果是TP的话，主进程与子进程会同时读取同一份权重文件，这里可以看到利用
+        # tp_rank进行了切分，每个GPU只读取属于自己计算的一部分权重，而不需要进行进程的通信
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param_data.copy_(loaded_weight)
 

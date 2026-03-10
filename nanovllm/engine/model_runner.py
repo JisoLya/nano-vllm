@@ -23,7 +23,13 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        dist.init_process_group(
+            "nccl",
+            "tcp://localhost:2333",
+            # GPU个数
+            world_size=self.world_size,
+            rank=rank
+        )
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
@@ -36,6 +42,7 @@ class ModelRunner:
         # 分配kv cache
         self.allocate_kv_cache()
         if not self.enforce_eager:
+            # 启用cuda graph
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -62,6 +69,7 @@ class ModelRunner:
 
     def loop(self):
         while True:
+            # 如果是子进程，会在这里阻塞
             method_name, args = self.read_shm()
             self.call(method_name, *args)
             if method_name == "exit":
@@ -69,6 +77,7 @@ class ModelRunner:
 
     def read_shm(self):
         assert self.world_size > 1 and self.rank > 0
+        # 子进程的通信，等待
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
@@ -82,10 +91,12 @@ class ModelRunner:
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
         for event in self.event:
+            # 类似于线程的notify，通知其他子进程来执行read_shm
             event.set()
 
     def call(self, method_name, *args):
         if self.world_size > 1 and self.rank == 0:
+            # 主进程写入方法名与入参
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
         return method(*args)
@@ -118,7 +129,14 @@ class ModelRunner:
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(
+            2,  # 维度0：0=key cache，1=value cache
+            hf_config.num_hidden_layers,  # 维度1：模型的隐藏层/注意力层数（如Qwen3-7B有32层）
+            config.num_kvcache_blocks,  # 维度2：预分配的KV Cache块数量（由显存大小计算得出）
+            self.block_size,  # 维度3：每个Cache块的token数量（如128/256）
+            num_kv_heads,  # 维度4：当前GPU上的KV注意力头数（Tensor Parallel后）
+            head_dim,  # 维度5：每个注意力头的维度（如Qwen3是128）
+        )
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -145,6 +163,7 @@ class ModelRunner:
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens:])
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
+            # 进入网络进行计算的token数量
             seqlen_q = seqlen - seq.num_cached_tokens
             seqlen_k = seqlen
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
@@ -154,11 +173,17 @@ class ModelRunner:
             if not seq.block_table:    # warmup
                 continue
             for i in range(seq.num_cached_blocks, seq.num_blocks):
+                # 获取当前需要缓存的token起点，其中seq.block_table是在block_manager中进行更新的
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
                     end = start + self.block_size
                 else:
-                    end = start + seq.last_block_num_tokens 
+                    end = start + seq.last_block_num_tokens
+                    # 如果当前块不满的情况下，最后一段的token的显存是怎么样分配的呢？
+                    # 其实物理显存仍旧是按照整块进行分配的 Q: 那么这样按照block进行分配不一样有内存碎片吗?
+                    # 仍旧有内存碎片是正确的，只是相比较原来大大减少了内存碎片，假设原来模型上下文是1024个token，但是
+                    # 用户只输入了10个，那么剩下的1014个全部被浪费了;如果有block的情况下，当block_size = 64时，那么
+                    # 这个请求只会分配一个block，而不是一整段的上下文长度，这样浪费的内存就从1014个token变为了54个token。
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
@@ -167,6 +192,7 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        # 写入context
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
@@ -179,6 +205,7 @@ class ModelRunner:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
+            # 由于decode阶段只生成一个token -1代表这里的id是从0开始的，因此是 长度-1
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -232,6 +259,7 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
+        # 向上取整
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
