@@ -98,7 +98,25 @@ class Llama2DecoderLayer(nn.Module):
 
 
 class Llama2MLP(nn.Module):
-    pass
+    def __init__(self, intermediate_size, hidden_size):
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+        )
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x = self.down_proj(x)
+        return x
 
 
 class Llama2Attention(nn.Module):
@@ -120,6 +138,8 @@ class Llama2Attention(nn.Module):
         self.qkv_bias = qkv_bias
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
+        self.q_size = head_dim * num_attention_heads
+        self.kv_size = head_dim * num_key_value_heads
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -130,7 +150,7 @@ class Llama2Attention(nn.Module):
         )
 
         self.o_proj = RowParallelLinear(
-            head_dim * num_attention_heads,
+            self.q_size,
             hidden_size,
             qkv_bias
         )
@@ -141,3 +161,23 @@ class Llama2Attention(nn.Module):
             base=rope_theta,
             rope_scaling=None,
         )
+        self.attn = Attention(
+            num_heads=num_attention_heads,
+            head_dim=head_dim,
+            scale=rope_scaling,
+            num_kv_heads=self.num_key_value_heads,
+        )
+
+    def forward(self, position_ids, hidden_states):
+        qkv = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q = q.view(-1, self.num_attention_heads, self.head_dim)
+        k = k.view(-1, self.num_key_value_heads, self.head_dim)
+        v = v.view(-1, self.num_key_value_heads, self.head_dim)
+
+        q, k = self.rotary_emb(position_ids, q, k)
+        o = self.attn(q, k, v)
+        # o.shape [num_tokens, head_num, head_dim]
+        # 需要将o展平为[num_tokens, hidden_size]
+        output = self.o_proj(o.flatten(1, -1))
+        return output
