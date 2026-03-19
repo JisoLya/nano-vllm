@@ -28,6 +28,7 @@ class RotaryEmbedding(nn.Module):
         assert rotary_dim == head_size
         # 旋转的基频， 由于奇数列和偶数列共享同一个频率，只是正余弦的区别
         # 这里的base是10000
+        self.inv_freq = nn.Parameter(torch.Tensor(64))
         inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         # max_position_embeddings 模型支持的最大上下文长度，生成位置索引[0, 1,...., max_position_embeddings]
         t = torch.arange(max_position_embeddings, dtype=torch.float)
