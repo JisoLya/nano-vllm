@@ -6,11 +6,28 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.models.llama import Llama2ForCausalLM
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.models.qwen3moe import Qwen3MoeForCausalLM
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
+# 由于原本就支持Qwen2.5与Qwen3，这里把他们都直接map为Qwen3ForCausalLM
+MODEL_ARCH_MAPPING = {
+    "LlamaForCausalLM": Llama2ForCausalLM,
+    "Qwen2ForCausalLM": Qwen3ForCausalLM,
+    "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
+    "Qwen3ForCausalLM": Qwen3ForCausalLM,
+}
+
+
+def get_model(config: Config):
+    model_name = config.architectures[0]
+    if model_name in MODEL_ARCH_MAPPING:
+        return MODEL_ARCH_MAPPING[model_name]
+    else:
+        raise NotImplementedError(f"Model {model_name} not implemented.")
 
 class ModelRunner:
 
@@ -34,7 +51,8 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        model_class = get_model(hf_config)
+        self.model = model_class(hf_config)
         load_model(self.model, config.model)
         # 初始化采样器
         self.sampler = Sampler()
@@ -49,7 +67,7 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+                self.shm = SharedMemory(name="nanovllm", create=True, size=2 ** 20)
                 dist.barrier()
             else:
                 dist.barrier()
@@ -80,7 +98,7 @@ class ModelRunner:
         # 子进程的通信，等待
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
-        method_name, *args = pickle.loads(self.shm.buf[4:n+4])
+        method_name, *args = pickle.loads(self.shm.buf[4:n + 4])
         self.event.clear()
         return method_name, args
 
@@ -89,7 +107,7 @@ class ModelRunner:
         data = pickle.dumps([method_name, *args])
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")
-        self.shm.buf[4:n+4] = data
+        self.shm.buf[4:n + 4] = data
         for event in self.event:
             # 类似于线程的notify，通知其他子进程来执行read_shm
             event.set()
@@ -170,7 +188,7 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:    # warmup
+            if not seq.block_table:  # warmup
                 continue
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 # 获取当前需要缓存的token起点，其中seq.block_table是在block_manager中进行更新的
@@ -185,7 +203,7 @@ class ModelRunner:
                     # 用户只输入了10个，那么剩下的1014个全部被浪费了;如果有block的情况下，当block_size = 64时，那么
                     # 这个请求只会分配一个block，而不是一整段的上下文长度，这样浪费的内存就从1014个token变为了54个token。
                 slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:  # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -206,7 +224,7 @@ class ModelRunner:
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             # 由于decode阶段只生成一个token -1代表这里的id是从0开始的，因此是 长度-1
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -273,10 +291,11 @@ class ModelRunner:
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs],
+                        block_tables=block_tables[:bs])
+            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph

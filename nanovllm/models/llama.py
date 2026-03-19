@@ -66,21 +66,22 @@ class Llama2Model(nn.Module):
 class Llama2DecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig) -> None:
         super().__init__()
-        self.attn = Llama2Attention(
+        self.self_attn = Llama2Attention(
             config.hidden_size,
             config.num_attention_heads,
             config.num_key_value_heads,
             config.max_position_embeddings,
-            config.head_dim,
+            getattr(config, "head_dim", None),
             config.rms_norm_eps,
-            config.qkv_bias,
-            config.rope_theta,
-            config.rope_scaling,
+            getattr(config, "rope_theta", 1000000),
+            # config.rope_scaling,
         )
-        self.mlp = Llama2MLP()
-        self.input_layer_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rope_embed = get_rope(config.hidden_size, config.max_position_embeddings)
+        self.mlp = Llama2MLP(
+            config.intermediate_size,
+            config.hidden_size,
+        )
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self,
                 position_ids: torch.Tensor,
@@ -88,11 +89,11 @@ class Llama2DecoderLayer(nn.Module):
                 residual: torch.Tensor
                 ):
         if residual is None:
-            hidden_states, residual = self.input_layer_norm(hidden_states), hidden_states
+            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
-            hidden_states, residual = self.input_layer_norm(hidden_states, residual)
-        hidden_states = self.attn(position_ids, hidden_states)
-        hidden_states, residual = self.post_attn_norm(hidden_states, residual)
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(position_ids, hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -125,38 +126,38 @@ class Llama2Attention(nn.Module):
                  num_attention_heads,
                  num_key_value_heads,
                  max_position_embeddings,
-                 head_dim,
-                 rms_norm_eps,
-                 qkv_bias,
-                 rope_theta,
-                 rope_scaling):
+                 head_dim: int | None = None,
+                 rms_norm_eps: float = 1e-06,
+                 qkv_bias: bool = False,
+                 rope_theta: float = 10000,
+                 rope_scaling: tuple | None = None):
         super().__init__()
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.max_position_embeddings = max_position_embeddings
         self.rms_norm_eps = rms_norm_eps
-        self.qkv_bias = qkv_bias
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
+        self.head_dim = head_dim or hidden_size // num_attention_heads
         self.q_size = head_dim * num_attention_heads
         self.kv_size = head_dim * num_key_value_heads
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
-            head_dim,
+            self.head_dim,
             num_attention_heads,
             num_key_value_heads,
-            bias=qkv_bias,
+            bias=False,
         )
 
         self.o_proj = RowParallelLinear(
             self.q_size,
             hidden_size,
-            qkv_bias
+            False,
         )
         self.rotary_emb = get_rope(
-            hidden_size,
-            rotary_dim=head_dim,
+            self.head_dim,
+            rotary_dim=self.head_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=None,
