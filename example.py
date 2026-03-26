@@ -35,7 +35,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--tp-size", type=int, default=1)
     # model path
-    parser.add_argument("--model-path", type=str, default='/root/autodl-tmp/qwen/Qwen3-0.5B/Qwen/Qwen3-0.6B/')
+    # parser.add_argument("--model-path", type=str, default='/root/autodl-tmp/qwen/Qwen3-0.5B/Qwen/Qwen3-0.6B/')
+    parser.add_argument("--model-path", type=str, default='/root/autodl-tmp/Qwen/Qwen2-57B-A14B-Instruct-GPTQ-Int4')
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--max-tokens", type=int, default=256)
     args = parser.parse_args()

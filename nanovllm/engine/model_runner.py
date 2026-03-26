@@ -7,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.llama import Llama2ForCausalLM
+from nanovllm.models.qwen2moe import Qwen2MoeForCausalLM
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.models.qwen3moe import Qwen3MoeForCausalLM
@@ -19,6 +20,8 @@ MODEL_ARCH_MAPPING = {
     "Qwen2ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
+    # 这里使用的是量化版本
+    "Qwen2MoeForCausalLM": Qwen2MoeForCausalLM,
 }
 
 
