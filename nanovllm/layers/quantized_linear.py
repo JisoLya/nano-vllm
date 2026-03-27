@@ -1,6 +1,7 @@
 import torch
 from torch import nn
-from nanovllm.layers.linear import LinearBase, ColumnParallelLinear
+
+from nanovllm.layers.linear import LinearBase
 
 
 class GPTQLinear(LinearBase):

@@ -1,15 +1,12 @@
 import torch
 from torch import nn
 from transformers import Qwen2MoeConfig
-import torch.nn.functional as F
-import marlin
 
-from main import active_experts
-from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.embed_head import VocabParallelEmbedding
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.quantized_linear import GPTQLinear
-from nanovllm.utils.dequantized import triton_dequantize
+from triton_impl.gptq_quantize_kernel import fused_gate_up
+from triton_impl.matmul_gptq import matmul_gptq
 
 
 class Qwen2MoeForCausalLM(nn.Module):
@@ -149,7 +146,6 @@ class Qwen2MoeMLPBlock(nn.Module):
         return final_states
 
 
-# todo 单个专家的triton gate_up融合算子
 class Qwen2MoeExpert(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -158,7 +154,10 @@ class Qwen2MoeExpert(nn.Module):
         self.down_proj = GPTQLinear(config.hidden_size, )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        pass
+        x = fused_gate_up(x, gate=self.gate_proj, up=self.up_proj)
+        # todo 隐藏层与gptq量化的乘积， output_shape[M, hidden_size]
+        x = matmul_gptq(x, self.down_proj)
+        return x
 
 
 # todo Attention层的dequantize直接利用flash_attn库
