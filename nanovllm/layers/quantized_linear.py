@@ -13,16 +13,19 @@ class GPTQLinear(LinearBase):
 
         self.qweight = nn.Parameter(
             torch.empty((input_size // (32 // self.bits), output_size), dtype=torch.int32),
+            requires_grad=False
         )
 
         # 零点个数，由于group_size 是128
         # input_size int4 的个数， group多少个int4共享一个零点，存储进int32
         self.qzeros = nn.Parameter(
-            torch.empty((input_size // self.group_size, output_size // (32 // self.bits)), dtype=torch.int32)
+            torch.empty((input_size // self.group_size, output_size // (32 // self.bits)), dtype=torch.int32),
+            requires_grad=False
         )
 
         self.scales = nn.Parameter(
-            torch.empty((input_size // self.group_size, output_size), dtype=torch.float16)
+            torch.empty((input_size // self.group_size, output_size), dtype=torch.float16),
+            requires_grad=False
         )
         self.bias = nn.Parameter(
             torch.empty((output_size,), dtype=torch.float16),
@@ -30,6 +33,7 @@ class GPTQLinear(LinearBase):
         )
         self.g_idx = nn.Parameter(
             torch.empty((input_size,), dtype=torch.int32),
+            requires_grad=False
         )
 
         for p in [self.qweight, self.qzeros, self.scales, self.bias]:

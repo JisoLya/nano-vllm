@@ -1,111 +1,100 @@
 import torch
 import triton
 import triton.language as tl
-from numpy import dtype
-
-from nanovllm.layers.quantized_linear import GPTQLinear
 
 
 @triton.jit
 def _matmul_gptq_kernel(
-        x_ptr,
-        M, K, N,
-        output_ptr,
-        y_weight_ptr,
-        y_zeros_ptr,
-        y_scales_ptr,
-        y_bias_ptr,
-        stride_x_m, stride_x_n,
-        stride_o_k,
-        stride_w_n, stride_w_k,
-        stride_s_g, stride_s_n,  # scales的步长
-        stride_z_g, stride_z_k,  # zeros的步长
-        BLOCK_SIZE_M: tl.constexpr,
-        BLOCK_SIZE_K: tl.constexpr,
-        BLOCK_SIZE_N: tl.constexpr,
+        x_ptr, output_ptr, y_weight_ptr, y_zeros_ptr, y_scales_ptr, y_bias_ptr,
+        M, N, K,  # 统一顺序：M是行，N是缩减维度，K是输出维度
+        stride_xm, stride_xn,
+        stride_ok, stride_om,
+        stride_wn, stride_wk,  # 这里的 stride_wn 指向打包后的 N/8 维度
+        stride_sg, stride_sk,
+        stride_zg, stride_zk,
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_k = tl.program_id(1)
 
-    row_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    col_k = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-    mask_m = row_m < M
-    mask_k = col_k < K
-
+    rm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    rk = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
+
     for n in range(0, N, BLOCK_SIZE_N):
         # 遍历hidden_states
-        col_n = n + tl.arange(0, BLOCK_SIZE_N)
-        mask_n = col_n < N
-        x_block = tl.load(x_ptr + row_m[:, None] * stride_x_m + col_n[None, :] * stride_x_n,
-                          mask=mask_m[:, None] & mask_n[None, :],
-                          other=0.0).to(tl.float32)
+        rn = n + tl.arange(0, BLOCK_SIZE_N)
+        x_block = tl.load(x_ptr + rm[:, None] * stride_xm + rn[None, :] * stride_xn,
+                          mask=(rm[:, None] < M) & (rn[None, :] < N), other=0.0)
 
-        # 加载这一块对应的weight
         w_fp32 = dequantize_block(
             y_weight_ptr, y_scales_ptr, y_zeros_ptr,
-            col_n, col_k,
-            stride_w_k, stride_w_n,
-            stride_s_g, stride_s_n,
-            stride_z_g, stride_z_k,
-            bits=4
+            rn, rk,
+            stride_wn, stride_wk,
+            stride_sg, stride_sk,
+            stride_zg, stride_zk,
         )
 
-        accumulator += tl.dot(x_block, w_fp32)
+        accumulator += tl.dot(x_block.to(tl.float32), w_fp32, out_dtype=tl.float32)
 
     if y_bias_ptr is not None:
-        bias = tl.load(y_bias_ptr + col_k, mask=mask_k, other=0.0).to(tl.float32)
+        bias = tl.load(y_bias_ptr + rk, mask=(rk < K), other=0.0)
         accumulator += bias[None, :]
 
-    tl.store(output_ptr + row_m[:, None] * stride_x_m + col_k[None, :] * stride_o_k,
+    tl.store(output_ptr + rm[:, None] * stride_om + rk[None, :],
              accumulator.to(tl.float16),
-             mask=mask_m[:, None] & mask_k[None, :]
-             )
+             mask=(rm[:, None] < M) & (rk[None, :] < K))
 
 
 @triton.jit
 def dequantize_block(
         weight_ptr, scales_ptr, zeros_ptr,
-        rn, rk,  # rn -> N维, rk -> K维
-        stride_w_k, stride_w_n,  # 注意顺序：现在是[K/8, N]
-        stride_s_g, stride_s_k,  # scales: [N/128, N]
-        stride_z_g, stride_z_k,  # zeros: [N/128, N/8]
-        bits: tl.constexpr
+        rn, rk,
+        stride_wn, stride_wk,
+        stride_sg, stride_sk,
+        stride_zg, stride_zk,
 ):
-    group_size = 32 // bits  # 8
+    n_idx = rn // 8
+    n_shift = (rn % 8) * 4
 
-    k_idx = rk // group_size
-    shift = (rk % group_size) * bits
-
-    pack_w = tl.load(
-        weight_ptr + rn[:, None] * stride_w_n + k_idx[None, :] * stride_w_k
-    )
-    mask = (1 << bits) - 1
-    w_int = (pack_w >> shift[None, :]) & 0xF
+    offs_w = n_idx[:, None] * stride_wn + rk[None, :] * stride_wk
+    pack_w = tl.load(weight_ptr + offs_w)
+    w_int = (pack_w >> n_shift[:, None]) & 0xF
 
     g_idx = rn // 128
-    scales = tl.load(scales_ptr + g_idx[:, None] * stride_s_g + rk[None, :] * stride_s_k)
+    k_idx = rk // 8
+    k_shift = (rk % 8) * 4
 
-    z_k_idx = rk // 8
-    z_shift = (rk % 8) * 4
-    pack_z = tl.load(zeros_ptr + g_idx[:, None] * stride_z_g + z_k_idx[None, :] * stride_z_k)
-    z_int = (pack_z >> z_shift[None, :]) & 0xF
+    offs_z = g_idx[:, None] * stride_zg + k_idx[None, :] * stride_zk
+    pack_z = tl.load(zeros_ptr + offs_z)
+    z_int = (pack_z >> k_shift[None, :]) & 0xF
+
+    offs_s = g_idx[:, None] * stride_sg + rk[None, :] * stride_sk
+    scales = tl.load(scales_ptr + offs_s)
+
     return (w_int.to(tl.float32) - z_int.to(tl.float32)) * scales.to(tl.float32)
 
 
-# x[M, intermediate_size]
-def matmul_gptq(x: torch.Tensor, down_proj: GPTQLinear) -> torch.Tensor:
+def matmul_gptq(x: torch.Tensor, down_proj) -> torch.Tensor:
     M, N = x.shape
-    N, K = down_proj.shape
+    _, K = down_proj.qweight.shape
 
     output = torch.empty((M, K), dtype=torch.float16, device=x.device)
 
     grid = lambda meta: (
-        (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(K, meta['BLOCK_SIZE_K'])),
+        triton.cdiv(M, meta['BLOCK_SIZE_M']),
+        triton.cdiv(K, meta['BLOCK_SIZE_K'])
     )
 
     _matmul_gptq_kernel[grid](
-
+        x, output,
+        down_proj.qweight, down_proj.qzeros, down_proj.scales, down_proj.bias,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        output.stride(1), output.stride(0),
+        down_proj.qweight.stride(0), down_proj.qweight.stride(1),
+        down_proj.scales.stride(0), down_proj.scales.stride(1),
+        down_proj.qzeros.stride(0), down_proj.qzeros.stride(1),
+        BLOCK_SIZE_M=64, BLOCK_SIZE_N=32, BLOCK_SIZE_K=64  # 常见的性能参数
     )
-
     return output
