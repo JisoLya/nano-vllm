@@ -187,7 +187,7 @@ class Qwen3MoeSparseMLPBlock(nn.Module):
 
         for expert_idx in active_experts:
             expert_layer = self.experts[expert_idx]
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx].squeeze(0))
             current_state = hidden_states[None, token_idx].reshape(-1, self.hidden_dim)  # [num_tokens,hidden_states]
             current_state = (
                     expert_layer(current_state) * router_top_value[token_idx, top_k_pos, None]

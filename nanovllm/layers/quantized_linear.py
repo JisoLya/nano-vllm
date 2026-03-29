@@ -41,18 +41,8 @@ class GPTQLinear(LinearBase):
         self.g_idx.weight_loader = self.weight_loader
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: int = None):
-        if shard_id is None:
-            param.data.copy_(loaded_weight)
-            return
-
-        output_dim = param.data.shape[-1]
-        shard_size = output_dim // 2
-
-        start_idx = shard_id * shard_size
-        end_idx = (shard_id + 1) * shard_size
-
-        param.data[..., start_idx:end_idx].copy_(loaded_weight)
-        # print(f"  [Merge] Loaded {shard_id} into range [{start_idx}:{end_idx}]")
+        param.data.copy_(loaded_weight)
+        return
 
     def forward(self, x):
         # 暂时留空，之后我们需要在这里集成 Marlin 或 ExLlamaV2 的 C++ 算子
