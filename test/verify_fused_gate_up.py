@@ -140,7 +140,7 @@ def prepare_hidden_size(M, N):
 
 def verify_gate_up(atol=1e-2, rtol=1e-1):
     torch.manual_seed(0)
-    hidden_size = prepare_hidden_size(2560, 3584)
+    hidden_size = prepare_hidden_size(2560, 3584) * 0.001
 
     g_w, g_z, g_s = prepare_data()
     u_w, u_z, u_s = prepare_data()
@@ -153,7 +153,6 @@ def verify_gate_up(atol=1e-2, rtol=1e-1):
         dim=-1).to(torch.float16)
     fused_kernel = SiluAndMul()
     ref = fused_kernel(gate_up)
-    print(f'ref.shape = {ref.shape}')
 
     quantize_gate = MockGPTQLinear(g_w, g_z, g_s)
     quantize_up = MockGPTQLinear(u_w, u_z, u_s)
@@ -161,6 +160,8 @@ def verify_gate_up(atol=1e-2, rtol=1e-1):
     tri = fused_gate_up(hidden_size, quantize_gate, quantize_up)
 
     torch.testing.assert_close(ref, tri, atol=atol, rtol=rtol)
+    print("Verify Gate-Up PASSED")
+
 
 if __name__ == "__main__":
     # verify_dequantize()
