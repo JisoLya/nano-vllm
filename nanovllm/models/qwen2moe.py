@@ -41,7 +41,6 @@ class Qwen2MoeForCausalLM(nn.Module):
             self,
             hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # print(f'hidden_states.mean() = {hidden_states.mean()}\n hidden_states.std() = {hidden_states.std()}\n')
         return self.lm_head(hidden_states)
 
 
@@ -63,11 +62,9 @@ class Qwen2MoeModel(nn.Module):
             positions: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
-        print(f"DEBUG: Embedding mean: {hidden_states.mean()}, max: {hidden_states.max()}")
         residual = None
         for i, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
-            # print(f"Layer {i} output mean: {hidden_states.mean()}")
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -89,13 +86,11 @@ class Qwen2MoeDecoder(nn.Module):
         if residual is None:
             residual, hidden_states = hidden_states, self.input_layernorm(hidden_states)
         else:
-            # 这里都是fp16的数据格式
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        # fp16
         return hidden_states, residual
 
 
@@ -158,7 +153,6 @@ class Qwen2MoeExpert(nn.Module):
         self.down_proj = GPTQLinear(config.moe_intermediate_size, config.hidden_size, config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # print(f"Input X mean: {x.mean()}, max: {x.max()}")
         x = fused_gate_up(x, gate=self.gate_proj, up=self.up_proj)
         x = matmul_gptq(x, self.down_proj)
         return x
@@ -221,10 +215,7 @@ class Qwen2MoeAttention(nn.Module):
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         # 没有qkv_bias
-        # print(
-        #     f'After Matmul q.std():{q.std()}\tq.mean(): {q.mean()}\nk.std():{k.std()}\tk.mean(): {k.mean()}\nv.std():{v.std()}\tv.mean(): {v.mean()}\n')
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
-        # print(f'After qkv_attention:o.std(): {o.std()}\to.mean(): {o.mean()}')
         output = matmul_gptq(o.flatten(1, -1), self.o_proj)
         return output
