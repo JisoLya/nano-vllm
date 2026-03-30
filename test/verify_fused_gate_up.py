@@ -2,6 +2,10 @@ import torch
 import triton
 import triton.language as tl
 
+from nanovllm.layers.activation import SiluAndMul
+from test.mock.mock_GPTQLinear import MockGPTQLinear
+from triton_impl.gptq_quantize_kernel import fused_gate_up
+
 
 def prepare_data(device="cuda"):
     weight = torch.randint(
@@ -119,7 +123,7 @@ def unpack_w_triton(w: torch.Tensor,
     return output
 
 
-def verify(atol=1e-2, rtol=1e-1):
+def verify_dequantize(atol=1e-2, rtol=1e-1):
     torch.manual_seed(0)
     w, z, s = prepare_data()
 
@@ -127,8 +131,37 @@ def verify(atol=1e-2, rtol=1e-1):
     w_triton = unpack_w_triton(w, z, s)
 
     torch.testing.assert_close(w_torch, w_triton, atol=atol, rtol=rtol)
-    print("PASSED")
+    print("Verify De-quantize PASSED")
 
+
+def prepare_hidden_size(M, N):
+    return torch.randn((M, N), device="cuda")
+
+
+def verify_gate_up(atol=1e-2, rtol=1e-1):
+    torch.manual_seed(0)
+    hidden_size = prepare_hidden_size(2560, 3584)
+
+    g_w, g_z, g_s = prepare_data()
+    u_w, u_z, u_s = prepare_data()
+
+    gate = unpack_wzs_torch(g_w, g_z, g_s)
+    up = unpack_wzs_torch(u_w, u_z, u_s)
+
+    gate_up = torch.cat(
+        (hidden_size @ gate, hidden_size @ up),
+        dim=-1).to(torch.float16)
+    fused_kernel = SiluAndMul()
+    ref = fused_kernel(gate_up)
+    print(f'ref.shape = {ref.shape}')
+
+    quantize_gate = MockGPTQLinear(g_w, g_z, g_s)
+    quantize_up = MockGPTQLinear(u_w, u_z, u_s)
+
+    tri = fused_gate_up(hidden_size, quantize_gate, quantize_up)
+
+    torch.testing.assert_close(ref, tri, atol=atol, rtol=rtol)
 
 if __name__ == "__main__":
-    verify()
+    # verify_dequantize()
+    verify_gate_up()
