@@ -4,7 +4,6 @@ import triton.language as tl
 
 
 def prepare_data(device="cuda"):
-    torch.manual_seed(0)
     weight = torch.randint(
         0, 0xFFFFFFF,
         size=(448, 2560),
@@ -28,13 +27,13 @@ def prepare_data(device="cuda"):
 def unpack_wzs_torch(w: torch.Tensor,
                      z: torch.Tensor,
                      s: torch.Tensor) -> torch.Tensor:
-    original_weight = torch.empty((3584, 2560))
+    original_weight = torch.empty((3584, 2560), device="cuda")
     for i in range(w.shape[0]):
         for j in range(8):
             original_weight[i * 8 + j, :] = (w[i] >> (j * 4)) & 0xf
 
     # 把z按列依次4bit拆开
-    unpack_z = torch.empty((28, 2560))
+    unpack_z = torch.empty((28, 2560), device="cuda")
     for i in range(z.shape[0]):
         for j in range(320):
             for k in range(8):
@@ -49,20 +48,87 @@ def unpack_wzs_torch(w: torch.Tensor,
     return original_weight
 
 
+@triton.jit
+def de_quantize_block_kernel(
+        w_ptr, z_ptr, s_ptr, o_ptr,
+        M, N,  # 目标矩阵的维度 (3584, 2560)
+        stride_wk, stride_wn,
+        stride_zk, stride_zn,  # 增加 z 的列步长
+        stride_sk, stride_sn,  # 增加 s 的列步长
+        stride_ok, stride_on,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    rm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    rn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    m_mask = rm < M
+    n_mask = rn < N
+
+    rk_packed = rm // 8
+    rk_shift = (rm % 8) * 4
+
+    group_idx = rm // 128
+    rn_packed = rn // 8
+    rn_shift = (rn % 8) * 4
+
+    # 加载权重
+    w_offsets = rk_packed[:, None] * stride_wk + rn[None, :] * stride_wn
+    w_packed = tl.load(w_ptr + w_offsets, mask=m_mask[:, None] & n_mask[None, :], other=0)
+
+    z_offsets = group_idx[:, None] * stride_zk + rn_packed[None, :] * stride_zn
+    z_packed = tl.load(z_ptr + z_offsets, mask=m_mask[:, None] & n_mask[None, :], other=0)
+    s_offsets = group_idx[:, None] * stride_sk + rn[None, :] * stride_sn
+    s_packed = tl.load(s_ptr + s_offsets, mask=m_mask[:, None] & n_mask[None, :], other=1.0)
+
+    w_unpacked = (w_packed >> rk_shift[:, None]) & 0xf
+    z_unpacked = (z_packed >> rn_shift[None, :]) & 0xf
+
+    out = (w_unpacked.to(tl.float32) - z_unpacked.to(tl.float32)) * s_packed.to(tl.float32)
+
+    out_offsets = rm[:, None] * stride_ok + rn[None, :] * stride_on
+    tl.store(o_ptr + out_offsets, out.to(tl.float16), mask=m_mask[:, None] & n_mask[None, :])
+
+
 def unpack_w_triton(w: torch.Tensor,
                     z: torch.Tensor,
                     s: torch.Tensor) -> torch.Tensor:
-    output = torch.empty((3584, 2560))
-    K, N = output.shape
+    output = torch.empty((3584, 2560), device="cuda")
+    M, N = output.shape
 
-    gird = lambda meta: (
-        (tl.cdiv(K, meta['BLOCK_SIZE_K']), tl.cdiv(N, meta['BLOCK_SIZE_N'])
+    grid = lambda meta: (
+        (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(N, meta['BLOCK_SIZE_N'])
          )
     )
+    # [M, K] @ [K, N] -> [M, N]
+    # x @ weight -> output
 
+    # 这里K = w.shape[0] * 8, (M, N) -> (3584, 2560)
+    de_quantize_block_kernel[grid](
+        w, z, s, output,
+        M, N,
+        w.stride(0), w.stride(1),
+        z.stride(0), z.stride(1),
+        s.stride(0), s.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_SIZE_M=32,
+        BLOCK_SIZE_N=32
+    )
     return output
 
 
-if __name__ == "__main__":
+def verify(atol=1e-2, rtol=1e-1):
+    torch.manual_seed(0)
     w, z, s = prepare_data()
-    original = unpack_wzs_torch(w, z, s)
+
+    w_torch = unpack_wzs_torch(w, z, s)
+    w_triton = unpack_w_triton(w, z, s)
+
+    torch.testing.assert_close(w_torch, w_triton, atol=atol, rtol=rtol)
+    print("PASSED")
+
+
+if __name__ == "__main__":
+    verify()
