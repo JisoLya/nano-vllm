@@ -112,7 +112,7 @@ def dequantize_block(
     z_unpacked = (z_packed >> zn_shift[None, :]) & 0xF
 
     # 返回 FP32 结果供 tl.dot 使用
-    return (w_unpacked.to(tl.float32) - z_unpacked.to(tl.float32)) * s.to(tl.float32)
+    return (w_unpacked.to(tl.float32) - (z_unpacked.to(tl.float32) + 1)) * s.to(tl.float32)
 
 
 def fused_gate_up(hidden_state: torch.Tensor, gate, up) -> torch.Tensor:

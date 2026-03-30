@@ -3,3 +3,4 @@ class MockGPTQLinear():
         self.qweight = q
         self.qzeros = z
         self.scales = s
+        self.bias = None

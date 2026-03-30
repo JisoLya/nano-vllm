@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+from triton_impl.gptq_quantize_kernel import dequantize_block
+
 autotune_configs = [
     triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64}, num_stages=3,
                   num_warps=8),
@@ -26,12 +28,12 @@ autotune_configs = [
 @triton.jit
 def _matmul_gptq_kernel(
         x_ptr, output_ptr, y_weight_ptr, y_zeros_ptr, y_scales_ptr, y_bias_ptr,
-        M, N, K,  # 统一顺序：M是行，N是缩减维度，K是输出维度
+        M, N, K,
         stride_xm, stride_xn,
         stride_ok, stride_om,
-        stride_wn, stride_wk,  # 这里的 stride_wn 指向打包后的 N/8 维度
-        stride_sg, stride_sk,
-        stride_zg, stride_zk,
+        stride_wk, stride_wn,  # 接收 qweight 的 strides
+        stride_sk, stride_sn,  # 接收 scales 的 strides
+        stride_zk, stride_zn,  # 接收 qzeros 的 strides
         BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -42,17 +44,23 @@ def _matmul_gptq_kernel(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
 
     for n in range(0, N, BLOCK_SIZE_N):
-        # 遍历hidden_states
         rn = n + tl.arange(0, BLOCK_SIZE_N)
+
+        # 1. 生成 mask (解决越界产生 inf 的核心)
+        x_row_mask = rm[:, None] < M
+        w_row_mask = rn < N
+        col_mask = rk < K
+
         x_block = tl.load(x_ptr + rm[:, None] * stride_xm + rn[None, :] * stride_xn,
-                          mask=(rm[:, None] < M) & (rn[None, :] < N), other=0.0)
+                          mask=x_row_mask & w_row_mask[None, :], other=0.0)
 
         w_fp32 = dequantize_block(
             y_weight_ptr, y_scales_ptr, y_zeros_ptr,
             rn, rk,
-            stride_wn, stride_wk,
-            stride_sg, stride_sk,
-            stride_zg, stride_zk,
+            stride_wk, stride_wn,  # 对应 dequantize_block 里的 weight stride
+            stride_zk, stride_zn,  # 对应 dequantize_block 里的 zero stride
+            stride_sk, stride_sn,  # 对应 dequantize_block 里的 scale stride
+            w_row_mask, col_mask  # 补充上原先漏传的 mask！避免读取越界垃圾数据
         )
 
         accumulator += tl.dot(x_block.to(tl.float32), w_fp32, out_dtype=tl.float32)
@@ -64,35 +72,6 @@ def _matmul_gptq_kernel(
     tl.store(output_ptr + rm[:, None] * stride_om + rk[None, :],
              accumulator.to(tl.float16),
              mask=(rm[:, None] < M) & (rk[None, :] < K))
-
-
-@triton.jit
-def dequantize_block(
-        weight_ptr, scales_ptr, zeros_ptr,
-        rn, rk,
-        stride_wn, stride_wk,
-        stride_sg, stride_sk,
-        stride_zg, stride_zk,
-):
-    n_idx = rn // 8
-    n_shift = (rn % 8) * 4
-
-    offs_w = n_idx[:, None] * stride_wn + rk[None, :] * stride_wk
-    pack_w = tl.load(weight_ptr + offs_w)
-    w_int = (pack_w >> n_shift[:, None]) & 0xF
-
-    g_idx = rn // 128
-    k_idx = rk // 8
-    k_shift = (rk % 8) * 4
-
-    offs_z = g_idx[:, None] * stride_zg + k_idx[None, :] * stride_zk
-    pack_z = tl.load(zeros_ptr + offs_z)
-    z_int = (pack_z >> k_shift[None, :]) & 0xF
-
-    offs_s = g_idx[:, None] * stride_sg + rk[None, :] * stride_sk
-    scales = tl.load(scales_ptr + offs_s)
-
-    return (w_int.to(tl.float32) - z_int.to(tl.float32)) * scales.to(tl.float32)
 
 
 def matmul_gptq(x: torch.Tensor, down_proj) -> torch.Tensor:
@@ -112,6 +91,8 @@ def matmul_gptq(x: torch.Tensor, down_proj) -> torch.Tensor:
         M, N, K,
         x.stride(0), x.stride(1),
         output.stride(1), output.stride(0),
+
+        # 按正确的顺序传给 Kernel
         down_proj.qweight.stride(0), down_proj.qweight.stride(1),
         down_proj.scales.stride(0), down_proj.scales.stride(1),
         down_proj.qzeros.stride(0), down_proj.qzeros.stride(1),

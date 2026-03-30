@@ -9,22 +9,22 @@ from triton_impl.gptq_quantize_kernel import fused_gate_up
 
 def prepare_data(device="cuda"):
     weight = torch.randint(
-        0, 0xFFFFFFF,
+        0, 0xFFFFFFFF + 1,
         size=(448, 2560),
-        dtype=torch.int32,
+        dtype=torch.int64,
         device=device
-    )
+    ).to(torch.int32)
+
     zeros = torch.randint(
-        0, 0xFFFFFFF,
+        0, 0xFFFFFFFF + 1,
         size=(28, 320),
-        dtype=torch.int32,
+        dtype=torch.int64,
         device=device
-    )
-    scales = torch.randn(
-        (28, 2560),
-        dtype=torch.float16,
-        device=device
-    )
+    ).to(torch.int32)
+
+    scales = torch.empty((28, 2560), dtype=torch.float16, device=device)
+    scales.uniform_(0.005, 0.02)
+
     return weight, zeros, scales
 
 
@@ -134,8 +134,8 @@ def verify_dequantize(atol=1e-2, rtol=1e-1):
     print("Verify De-quantize PASSED")
 
 
-def prepare_hidden_size(M, N):
-    return torch.randn((M, N), device="cuda")
+def prepare_hidden_size(M, N, device="cuda"):
+    return torch.randn((M, N), dtype=torch.float16, device=device).clamp(-4.0, 4.0)
 
 
 def verify_gate_up(atol=1e-2, rtol=1e-1):
