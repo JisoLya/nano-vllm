@@ -1,6 +1,6 @@
 import torch
 
-from triton_impl.matmul_gptq import matmul_gptq
+from nanovllm.triton_impl.matmul_gptq import matmul_gptq
 
 
 # 假设你的 GPTQLinear 类定义如下

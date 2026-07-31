@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from triton_impl.gptq_quantize_kernel import dequantize_block
+from nanovllm.triton_impl.gptq_quantize_kernel import dequantize_block
 
 @triton.jit
 def _matmul_gptq_kernel(
@@ -35,11 +35,12 @@ def _matmul_gptq_kernel(
 
         w_fp32 = dequantize_block(
             y_weight_ptr, y_scales_ptr, y_zeros_ptr,
-            rn, rk,
+            n, rk,
             stride_wk, stride_wn,  # 对应 dequantize_block 里的 weight stride
             stride_zk, stride_zn,  # 对应 dequantize_block 里的 zero stride
             stride_sk, stride_sn,  # 对应 dequantize_block 里的 scale stride
-            w_row_mask, col_mask  # 补充上原先漏传的 mask！避免读取越界垃圾数据
+            K, N ,
+            BLOCK_SIZE_K, BLOCK_SIZE_N
         )
 
         accumulator += tl.dot(x_block.to(tl.float32), w_fp32, out_dtype=tl.float32)

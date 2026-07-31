@@ -7,8 +7,8 @@ from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.quantized_linear import GPTQLinear
 from nanovllm.layers.rotary_embedding import get_rope
-from triton_impl.gptq_quantize_kernel import fused_gate_up
-from triton_impl.matmul_gptq import matmul_gptq
+from nanovllm.triton_impl.gptq_quantize_kernel import fused_gate_up
+from nanovllm.triton_impl.matmul_gptq import matmul_gptq
 
 
 class Qwen2MoeForCausalLM(nn.Module):

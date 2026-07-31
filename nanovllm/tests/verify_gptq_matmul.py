@@ -1,8 +1,8 @@
 import torch
 
-from test.mock.mock_GPTQLinear import MockGPTQLinear
-from triton_impl.matmul_gptq import matmul_gptq
-from verify_fused_gate_up import prepare_data, prepare_hidden_size, unpack_wzs_torch
+from nanovllm.tests.mock.mock_GPTQLinear import MockGPTQLinear
+from nanovllm.triton_impl.matmul_gptq import matmul_gptq
+from nanovllm.tests.verify_fused_gate_up import prepare_data, prepare_hidden_size, unpack_wzs_torch
 
 
 def verify_gptq_matmul():

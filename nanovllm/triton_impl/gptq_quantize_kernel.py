@@ -26,38 +26,53 @@ def _gate_up_silu_kernel(
         BLOCK_SIZE_N: tl.constexpr,
         BLOCK_SIZE_K: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = 8 * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * 8
+    group_size_m = min(num_pid_m - first_pid_m, 8)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
 
-    row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    col = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    row_mask = row < M
-    col_mask = col < N
+    # 2. 偏移计算
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    
+    mask_m = offs_m < M
+    mask_n = offs_n < N
 
     accumulator_gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     accumulator_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     for k in range(0, K, BLOCK_SIZE_K):
-        rk = k + tl.arange(0, BLOCK_SIZE_K)
-        k_mask = rk < K
+        offs_k = k + tl.arange(0, BLOCK_SIZE_K)
+        mask_k = offs_k < K
 
-        x = tl.load(x_ptr + row[:, None] * stride_xm + rk[None, :] * stride_xk,
-                    mask=row_mask[:, None] & k_mask[None, :], other=0.0)
+        x = tl.load(
+            x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0
+        ).to(tl.float16)
 
+        # 解包 Gate 权重
         w_gate = dequantize_block(
             gate_weight_ptr, gate_scales_ptr, gate_zeros_ptr,
-            rk, col, stride_wk, stride_wn, stride_zk, stride_zn, stride_sk, stride_sn,
-            k_mask, col_mask
+            k, offs_n, stride_wk, stride_wn, stride_zk, stride_zn, stride_sk, stride_sn,
+            K, N, BLOCK_SIZE_K, BLOCK_SIZE_N
         )
 
-        # 实时解包 Up 权重块: [BK, BN]
+        # 解包 Up 权重
         w_up = dequantize_block(
             up_weight_ptr, up_scales_ptr, up_zeros_ptr,
-            rk, col, stride_wk, stride_wn, stride_zk, stride_zn, stride_sk, stride_sn,
-            k_mask, col_mask
+            k, offs_n, stride_wk, stride_wn, stride_zk, stride_zn, stride_sk, stride_sn,
+            K, N, BLOCK_SIZE_K, BLOCK_SIZE_N
         )
-        accumulator_gate += tl.dot(x.to(tl.float16), w_gate.to(tl.float16))
-        accumulator_up += tl.dot(x.to(tl.float16), w_up.to(tl.float16))
+
+        # Tensor Core 矩阵乘法
+        accumulator_gate += tl.dot(x, w_gate)
+        accumulator_up += tl.dot(x, w_up)
 
     b_gate = tl.load(gate_bias_ptr + col, mask=col_mask, other=0.0).to(tl.float32)
     b_up = tl.load(up_bias_ptr + col, mask=col_mask, other=0.0).to(tl.float32)
@@ -70,46 +85,48 @@ def _gate_up_silu_kernel(
     fused_f32 = (gate_f32 * tl.sigmoid(gate_f32)) * up_f32
 
     tl.store(
-        output_ptr + row[:, None] * stride_om + col[None, :] * stride_on,
+        output_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
         fused_f32.to(tl.float16),
-        mask=row_mask[:, None] & col_mask[None, :]
+        mask=mask_m[:, None] & mask_n[None, :]
     )
 
 
 @triton.jit
 def dequantize_block(
-        ptr, scales_ptr, zeros_ptr,
-        row_k, col,
+        w_ptr, scales_ptr, zeros_ptr,
+        k_idx, col_idx,
         stride_wk, stride_wn,
         stride_zk, stride_zn,
         stride_sk, stride_sn,
-        row_mask, col_mask
+        K, N,
+        BLOCK_SIZE_K, BLOCK_SIZE_N,
 ):
-    wk_packed = row_k // 8
-    wk_shift = (row_k % 8) * 4
+    rk_packed = (k_idx // 8) + tl.arange(0, BLOCK_SIZE_K // 8)
+    w_offs = rk_packed[:, None] * stride_wk + col_idx[None, :] * stride_wn
+    w_mask = (rk_packed[:, None] < (K//8)) & (col_idx[None, :] < N)
+    
+    w_packed = tl.load(w_ptr + w_offs, mask=w_mask,other=0.0)
+    
+    shifts = (tl.arange(0, 8) * 4)[None, :,None]
+    w_unpacked = (w_packed[:, None, :] >> shifts) & 0xF
+    w_unpacked = tl.reshape(w_unpacked, [BLOCK_SIZE_K, BLOCK_SIZE_N])
+    
+    group_idx = k_idx // 8
+    col_packed = (col_idx // 8)
+    z_offsets = group_idx * stride_zk + col_packed[None, :] * stride_zn
+    z_mask = col_packed[None, :] < (N // 8)
+    z_packed = tl.load(zeros_ptr + z_offsets, mask=z_mask, other=0)
 
-    zn_packed = col // 8
-    zn_shift = (col % 8) * 4
+    shifts_n = (tl.arange(0, 8) * 4)[None, None, :]
+    z_unpacked = (z_packed[:, :, None] >> shifts_n) & 0xF
+    z_unpacked = tl.reshape(z_unpacked, (1, BLOCK_SIZE_N))
 
-    group_idx = row_k // 128
+    s_offsets = group_idx * stride_sk + col_idx[None, :] * stride_sn
+    s_mask = col_idx[None, :] < N
+    s = tl.load(scales_ptr + s_offsets, mask=s_mask, other=1.0) # (1, BN)
 
-    w_offsets = wk_packed[:, None] * stride_wk + col[None, :] * stride_wn
-    w_packed = tl.load(ptr + w_offsets, mask=row_mask[:, None] & col_mask[None, :], other=0)
-
-    # z_offsets: (BLOCK_SIZE_K, BLOCK_SIZE_N) -> group_idx, zn_packed
-    z_offsets = group_idx[:, None] * stride_zk + zn_packed[None, :] * stride_zn
-    z_packed = tl.load(zeros_ptr + z_offsets, mask=row_mask[:, None] & col_mask[None, :], other=0)
-
-    # s_offsets: (BLOCK_SIZE_K, BLOCK_SIZE_N)
-    s_offsets = group_idx[:, None] * stride_sk + col[None, :] * stride_sn
-    s = tl.load(scales_ptr + s_offsets, mask=row_mask[:, None] & col_mask[None, :], other=1.0)
-
-    # 3. 解包与计算
-    w_unpacked = (w_packed >> wk_shift[:, None]) & 0xF
-    z_unpacked = (z_packed >> zn_shift[None, :]) & 0xF
-
-    # 返回 FP32 结果供 tl.dot 使用
-    return (w_unpacked.to(tl.float32) - (z_unpacked.to(tl.float32) + 1)) * s.to(tl.float32)
+    w_fp16 = (w_unpacked.to(tl.float16) - (z_unpacked.to(tl.float16) + 1.0)) * s.to(tl.float16)
+    return w_fp16
 
 
 def fused_gate_up(hidden_state: torch.Tensor, gate, up) -> torch.Tensor:

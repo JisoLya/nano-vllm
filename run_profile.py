@@ -1,7 +1,7 @@
 import torch
 import triton
 import triton.testing
-from triton_impl.matmul_gptq import matmul_gptq
+from nanovllm.triton_impl.matmul_gptq import matmul_gptq
 # ---------------------------------------------------------
 # 1. 数据准备函数 (支持等比例放大)
 # ---------------------------------------------------------

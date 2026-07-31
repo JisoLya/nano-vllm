@@ -3,8 +3,8 @@ import triton
 import triton.language as tl
 
 from nanovllm.layers.activation import SiluAndMul
-from test.mock.mock_GPTQLinear import MockGPTQLinear
-from triton_impl.gptq_quantize_kernel import fused_gate_up
+from nanovllm.tests.mock.mock_GPTQLinear import MockGPTQLinear
+from nanovllm.triton_impl.gptq_quantize_kernel import fused_gate_up
 
 
 def prepare_data(device="cuda"):
@@ -145,8 +145,8 @@ def verify_gate_up(atol=1e-2, rtol=1e-1):
     g_w, g_z, g_s = prepare_data()
     u_w, u_z, u_s = prepare_data()
 
-    gate = unpack_wzs_torch(g_w, g_z, g_s)
-    up = unpack_wzs_torch(u_w, u_z, u_s)
+    gate = unpack_wzs_torch(g_w, g_z, g_s).to(torch.float16)
+    up = unpack_wzs_torch(u_w, u_z, u_s).to(torch.float16)
 
     gate_up = torch.cat(
         (hidden_size @ gate, hidden_size @ up),
